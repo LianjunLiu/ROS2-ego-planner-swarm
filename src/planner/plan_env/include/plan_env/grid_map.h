@@ -84,6 +84,8 @@ struct MappingParameters
   /* visualization and computation time display */
   double visualization_truncate_height_, virtual_ceil_height_, ground_height_, virtual_ceil_yp_, virtual_ceil_yn_;
   bool show_occ_time_;
+  double virtual_floor_height_ = -1000.0;
+  bool virtual_floor_active_ = false;
 
   /* active mapping */
   double unknown_flag_;
@@ -358,6 +360,8 @@ inline int GridMap::getInflateOccupancy(Eigen::Vector3d pos)
 {
   if (!isInMap(pos))
     return -1;
+  if (mp_.virtual_floor_active_ && pos.z() < mp_.virtual_floor_height_)
+    return 1;
 
   Eigen::Vector3i id;
   posToIndex(pos, id);

@@ -37,6 +37,8 @@ void GridMap::initMap(rclcpp::Node::SharedPtr node)
   node_->declare_parameter("grid_map/max_ray_length", -0.1);
   node_->declare_parameter("grid_map/visualization_truncate_height", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_height", -0.1);
+  mp_.virtual_floor_height_ = node_->declare_parameter<double>(
+      "grid_map/virtual_floor_height", -1000.0);
   node_->declare_parameter("grid_map/virtual_ceil_yp", -0.1);
   node_->declare_parameter("grid_map/virtual_ceil_yn", -0.1);
   node_->declare_parameter("grid_map/show_occ_time", false);
@@ -689,14 +691,29 @@ void GridMap::clearAndInflateLocalMap()
       }
 
   // add virtual ceiling to limit flight height
+  //
+  // Everything at and above ceil_id is filled, not just the single cell at
+  // ceil_id.  A one-cell-thick barrier does not actually constrain the planner:
+  // the B-spline's collision cost is evaluated at the control points, which are
+  // ctrl_pt_dist (0.3 m) apart, so a 0.10-0.15 m cell sitting between two of
+  // them is simply stepped over.  Measured with the single-cell version and
+  // virtual_ceil_height 3.0: the optimiser still humped the planned curve to
+  // 4.76 m -- well past the barrier -- and the vehicle followed it to 4.4 m.
+  // Filling upward makes the ceiling behave as the flight-height limit it is
+  // documented to be.
   if (mp_.virtual_ceil_height_ > -0.5)
   {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+    // The fill must reach the TOP OF THE MAP, not local_bound_max_(2): the
+    // local bound is the extent of the LiDAR returns, which in this world stops
+    // well under the ceiling, so clipping there made the loop empty and the
+    // ceiling was never written at all.
     for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
       for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-      {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+        for (int z = std::max(0, ceil_id); z < mp_.map_voxel_num_(2); ++z)
+        {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+        }
   }
 }
 
@@ -799,6 +816,12 @@ void GridMap::odomCallback(const nav_msgs::msg::Odometry::SharedPtr odom)
   md_.camera_pos_(0) = odom->pose.pose.position.x;
   md_.camera_pos_(1) = odom->pose.pose.position.y;
   md_.camera_pos_(2) = odom->pose.pose.position.z;
+
+  // Allow the initial vertical takeoff, then latch a floor constraint for
+  // navigation. A missing floor return must never create a tunnel under pillars.
+  if (mp_.virtual_floor_height_ > -999.0 &&
+      md_.camera_pos_.z() > mp_.virtual_floor_height_ + 0.2)
+    mp_.virtual_floor_active_ = true;
 
   md_.has_odom_ = true;
 }
@@ -905,12 +928,17 @@ void GridMap::cloudCallback(const sensor_msgs::msg::PointCloud2::ConstPtr &img)
 
   // add virtual ceiling to limit flight height
   // 添加虚拟天花板控制飞行高度
+  // Filled upward rather than a single cell; see the companion comment in
+  // resetBuffer() -- a 0.10-0.15 m sheet is invisible to a control polygon
+  // whose points are ctrl_pt_dist apart.
   if (mp_.virtual_ceil_height_ > -0.5) {
     int ceil_id = floor((mp_.virtual_ceil_height_ - mp_.map_origin_(2)) * mp_.resolution_inv_) - 1;
+    // Up to the top of the map, not local_bound_max_(2) -- see resetBuffer().
     for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
-      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y) {
-        md_.occupancy_buffer_inflate_[toAddress(x, y, ceil_id)] = 1;
-      }
+      for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
+        for (int z = std::max(0, ceil_id); z < mp_.map_voxel_num_(2); ++z) {
+          md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 1;
+        }
   }
 }
 

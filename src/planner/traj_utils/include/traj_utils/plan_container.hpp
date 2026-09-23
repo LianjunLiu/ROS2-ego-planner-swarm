@@ -90,12 +90,34 @@ namespace ego_planner
       {
         return global_traj_.evaluateVel(t - time_increase_);
       }
-      else
+      else if (!local_traj_.empty())
       {
         double tm, tmp;
         local_traj_[0].getTimeSpan(tm, tmp);
         return local_traj_[1].evaluateDeBoor(tm + t - local_start_time_);
       }
+      /* local_traj_ is empty.  setGlobalTraj() clears it and sets both local
+       * times to -1, so with a new global trajectory and no local one yet the
+       * first branch is empty and the second covers t <= global_duration_: the
+       * only way to reach here is t > global_duration_ + 1e-3, i.e. past the end
+       * of the global trajectory, where the trajectory is over and the velocity
+       * is zero.  Returning zero is therefore the answer, not a fallback.
+       *
+       * Do NOT instead fall back to global_traj_.evaluateVel(): that is not safe
+       * either, because PolynomialTraj::evaluate walks its segment index past the
+       * end for t beyond the duration (it has no bounds check) and indexes
+       * cxs[idx] out of range.  So this must be handled here, not deferred.
+       *
+       * This is reachable, not theoretical: getLocalTarget()'s sampling loop is
+       * `for (t = ...; t < global_duration_; t += t_step)`, which leaves t at or
+       * past global_duration_ on exit, and ego_replan_fsm.cpp:1110 passes that
+       * same t here.  Measured: trial 19 lost the planner to a SIGSEGV in this
+       * exact state, right after the clamp pulled the local target back --
+       * pulling the target back grows its distance to the goal, which is what
+       * steers execution past the near-goal branch at :1100 that would have
+       * zeroed the velocity safely.  The trial-12 fix removed this call from the
+       * A* branch only, so the identical call in the sibling branch survived. */
+      return Eigen::Vector3d::Zero();
     }
 
     Eigen::Vector3d getAcceleration(double t)
@@ -195,6 +217,12 @@ namespace ego_planner
     double ctrl_pt_dist;                  // distance between adjacient B-spline control points
     double feasibility_tolerance_;        // permitted ratio of vel/acc exceeding limits
     double planning_horizen_;
+    // How far into a candidate trajectory the final pre-publish collision check
+    // is enforced.  The B-spline optimizer only polices the first 2/3 of the
+    // control points, and the FSM replans within thresh_replan_time, so the
+    // tail of the curve is never flown as planned.  See the check in
+    // EGOPlannerManager::reboundReplan.
+    double traj_validation_window_;
     bool use_distinctive_trajs;
     int drone_id; // single drone: drone_id <= -1, swarm: drone_id >= 0
 

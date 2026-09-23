@@ -123,6 +123,7 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
     rclcpp::Time time_1 = rclcpp::Clock().now();
     ++rounds_;
 
+    path_override_.clear();
     step_size_ = step_size;
     inv_step_size_ = 1 / step_size;
     center_ = (start_pt + end_pt) / 2;
@@ -175,6 +176,10 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
             // if((time_2 - time_1).toSec() > 0.1)
             //     ROS_WARN("Time consume in A star path finding is %f", (time_2 - time_1).toSec() );
             gridPath_ = retrievePath(current);
+            // 0.45 m = three 0.15 m cells, enough to walk a path hugging a
+            // pillar corner to the centre of a 1.07 m passage, and short enough
+            // that it cannot hop into the next one.
+            path_override_ = refineToMedialAxis(getPath(), 0.45);
             return true;
         }
         current->state = GridNode::CLOSEDSET; //move current node from open set to closed set.
@@ -251,6 +256,9 @@ bool AStar::AstarSearch(const double step_size, Vector3d start_pt, Vector3d end_
 
 vector<Vector3d> AStar::getPath()
 {
+    if (!path_override_.empty())
+        return path_override_;
+
     vector<Vector3d> path;
 
     for (auto ptr : gridPath_)
@@ -258,4 +266,87 @@ vector<Vector3d> AStar::getPath()
 
     reverse(path.begin(), path.end());
     return path;
+}
+
+bool AStar::segmentFree(const Vector3d &a, const Vector3d &b)
+{
+    const double res = grid_map_->getResolution();
+    const double len = (b - a).norm();
+    const int n = max(1, (int)ceil(len / (res / 2.0)));
+    for (int i = 0; i <= n; ++i)
+        if (checkOccupancy(a + (b - a) * ((double)i / n)))
+            return false;
+    return true;
+}
+
+vector<Vector3d> AStar::refineToMedialAxis(const vector<Vector3d> &raw, double max_shift)
+{
+    if (raw.size() < 3 || max_shift <= 0.0)
+        return raw;
+
+    const double res = grid_map_->getResolution();
+
+    /* The radius of the largest all-free circle centred on p, up to 0.60 m --
+     * the room p has, not the distance to the nearest surface: GridMap has no
+     * distance field and building one costs more than this whole search.  The
+     * circle is sampled on 8 spokes, matching the square-ish inflation GridMap
+     * itself applies.  Returns -1 if p is not even free. */
+    auto clearance = [&](const Vector3d &p) {
+        if (checkOccupancy(p))
+            return -1.0;
+        double r = 0.0;
+        for (double rr = res; rr <= 0.60 + 1e-9; rr += res)
+        {
+            bool ok = true;
+            for (int a = 0; a < 8 && ok; ++a)
+            {
+                const double th = a * M_PI / 4.0;
+                ok = !checkOccupancy(p + Vector3d(rr * cos(th), rr * sin(th), 0.0));
+            }
+            if (!ok)
+                break;
+            r = rr;
+        }
+        return r;
+    };
+
+    /* A ring of candidates: 8 directions at 1..nring grid steps.  Deliberately
+     * not a dense sweep -- check_collision_and_rebound() runs this A* inside the
+     * optimisation loop, so the cost here is paid per iteration, and a hill climb
+     * over a ring finds the passage centre just as well as a 13x13 grid would. */
+    const int nring = max(1, (int)floor(max_shift / res + 1e-6));
+    vector<Vector3d> offsets;
+    for (int k = 0; k < 8; ++k)
+    {
+        const double th = k * M_PI / 4.0;
+        for (int j = 1; j <= nring; ++j)
+            offsets.push_back(Vector3d(j * res * cos(th), j * res * sin(th), 0.0));
+    }
+
+    vector<Vector3d> out(raw);
+    Vector3d prev = raw.front();
+    for (size_t i = 1; i + 1 < raw.size(); ++i)
+    {
+        double best_r = clearance(raw[i]);
+        Vector3d best = raw[i];
+        double best_move = 0.0;
+        for (const Vector3d &off : offsets)
+        {
+            const Vector3d cand = raw[i] + off;
+            const double r = clearance(cand);
+            const double move = off.norm();
+            if (r > best_r + 1e-9 || (r > best_r - 1e-9 && move < best_move))
+            {
+                if (!segmentFree(prev, cand) || !segmentFree(cand, raw[i + 1]))
+                    continue;
+                best = cand;
+                best_r = r;
+                best_move = move;
+            }
+        }
+        out[i] = best;
+        prev = best;
+    }
+
+    return out;
 }

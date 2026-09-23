@@ -1,5 +1,6 @@
 #include "bspline_opt/uniform_bspline.h"
 #include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
 #include "traj_utils/msg/bspline.hpp"
 #include "quadrotor_msgs/msg/position_command.hpp"
 #include "std_msgs/msg/empty.hpp"
@@ -7,6 +8,9 @@
 #include <rclcpp/rclcpp.hpp>
 
 rclcpp::Publisher<quadrotor_msgs::msg::PositionCommand>::SharedPtr pos_cmd_pub;
+rclcpp::Node::SharedPtr trajectory_node;
+rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub;
+std::string trajectory_frame;
 
 quadrotor_msgs::msg::PositionCommand cmd;
 double pos_gain[3] = {0, 0, 0};
@@ -66,6 +70,20 @@ void bsplineCallback(traj_utils::msg::Bspline::ConstPtr msg)
   traj_duration_ = traj_[0].getTimeSum();
 
   receive_traj_ = true;
+
+  nav_msgs::msg::Path path;
+  path.header.frame_id = trajectory_frame;
+  path.header.stamp = trajectory_node->now();
+  const int samples = std::max(1, static_cast<int>(std::ceil(traj_duration_ / 0.05)));
+  for (int i = 0; i <= samples; ++i) {
+    const auto p = traj_[0].evaluateDeBoorT(traj_duration_ * i / samples);
+    geometry_msgs::msg::PoseStamped pose;
+    pose.header = path.header;
+    pose.pose.position.x = p.x(); pose.pose.position.y = p.y(); pose.pose.position.z = p.z();
+    pose.pose.orientation.w = 1.0;
+    path.poses.push_back(pose);
+  }
+  path_pub->publish(path);
 }
 
 std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclcpp::Time &time_now, rclcpp::Time &time_last)
@@ -78,7 +96,8 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, rclc
   double yawdot = 0;
 
   Eigen::Vector3d dir = t_cur + time_forward_ <= traj_duration_ ? traj_[0].evaluateDeBoorT(t_cur + time_forward_) - pos : traj_[0].evaluateDeBoorT(traj_duration_) - pos;
-  double yaw_temp = dir.norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
+  // Vertical takeoff must not turn toward tiny horizontal estimation noise.
+  double yaw_temp = dir.head<2>().norm() > 0.1 ? atan2(dir(1), dir(0)) : last_yaw_;
   double max_yaw_change = YAW_DOT_MAX_PER_SEC * (time_now - time_last).seconds();
   if (yaw_temp - last_yaw_ > PI)
   {
@@ -167,14 +186,14 @@ void cmdCallback()
     return;
 
   // 统一时间源
-  rclcpp::Clock clock(RCL_ROS_TIME);  
-  rclcpp::Time time_now = clock.now();
+  rclcpp::Time time_now = trajectory_node->now();
   double t_cur = (time_now - start_time_).seconds();
 
   Eigen::Vector3d pos(Eigen::Vector3d::Zero()), vel(Eigen::Vector3d::Zero()), acc(Eigen::Vector3d::Zero()), pos_f;
   std::pair<double, double> yaw_yawdot(0, 0);
 
-  static rclcpp::Time time_last = clock.now();
+  static rclcpp::Time time_last = time_now;
+  if (time_now <= time_last) { time_last = time_now; return; }
   if (t_cur < traj_duration_ && t_cur >= 0.0)
   {
     pos = traj_[0].evaluateDeBoorT(t_cur);
@@ -203,11 +222,13 @@ void cmdCallback()
   else
   {
     cout << "[Traj server]: invalid time." << endl;
+    time_last = time_now;
+    return;
   }
   time_last = time_now;
 
   cmd.header.stamp = time_now;
-  cmd.header.frame_id = "world";
+  cmd.header.frame_id = trajectory_frame;
   cmd.trajectory_flag = quadrotor_msgs::msg::PositionCommand::TRAJECTORY_STATUS_READY;
   cmd.trajectory_id = traj_id_;
 
@@ -235,6 +256,10 @@ int main(int argc, char **argv)
 {
   rclcpp::init(argc, argv);
   auto node = rclcpp::Node::make_shared("traj_server");
+  trajectory_node = node;
+  trajectory_frame = node->declare_parameter<std::string>("traj_server/frame_id", "world");
+  path_pub = node->create_publisher<nav_msgs::msg::Path>(
+      "/ego/planned_path", rclcpp::QoS(1).transient_local());
 
   auto bspline_sub = node->create_subscription<traj_utils::msg::Bspline>(
       "planning/bspline",

@@ -60,6 +60,17 @@ namespace ego_planner
     double waypoints_[50][3];
     int waypoint_num_, wp_id_;
     double planning_horizen_, planning_horizen_time_;
+    bool clamp_local_target_; // pull a colliding local target back to free space
+    bool astar_local_target_; // take the local target off an A* path instead of the global polynomial
+    double astar_search_radius_, astar_lookahead_;
+    bool astar_global_path_; // fit the global trajectory through a map-aware route, not the straight line
+    /* The emergency stop re-fits the global route, but the EMERGENCY_STOP case
+     * runs on every FSM tick and the FSM can sit in that state for many ticks
+     * (10 consecutive transitions was measured once).  Re-running a whole-map
+     * search every tick would be a real load on the executor, and re-fitting
+     * repeatedly from a position that has barely moved cannot find anything new,
+     * so it is done once per goal instead. */
+    bool emergency_refit_done_ = false;
     double emergency_time_;
     bool flag_realworld_experiment_;
     bool enable_fail_safe_;
@@ -110,6 +121,11 @@ namespace ego_planner
 
     void readGivenWps();
     void planNextWaypoint(const Eigen::Vector3d next_wp);
+
+    /* Re-fit the global trajectory through a map-aware route to `goal`, and say
+     * whether that worked.  False means "no opinion" -- the caller falls back
+     * to the straight-line planGlobalTraj().  See the definition. */
+    bool planGlobalWithMap(const Eigen::Vector3d &goal);
     void getLocalTarget();
 
     /* ROS functions */

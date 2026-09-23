@@ -22,6 +22,11 @@ namespace ego_planner
     node_->declare_parameter("fsm/emergency_time", 1.0);
     node_->declare_parameter("fsm/realworld_experiment", false);
     node_->declare_parameter("fsm/fail_safe", true);
+    node_->declare_parameter("fsm/clamp_local_target", false);
+    node_->declare_parameter("fsm/astar_local_target", false);
+    node_->declare_parameter("fsm/astar_search_radius", 6.0);
+    node_->declare_parameter("fsm/astar_lookahead", 2.5);
+    node_->declare_parameter("fsm/astar_global_path", false);
 
     node_->get_parameter("fsm/flight_type", target_type_);
     node_->get_parameter("fsm/thresh_replan_time", replan_thresh_);
@@ -31,6 +36,11 @@ namespace ego_planner
     node_->get_parameter("fsm/emergency_time", emergency_time_);
     node_->get_parameter("fsm/realworld_experiment", flag_realworld_experiment_);
     node_->get_parameter("fsm/fail_safe", enable_fail_safe_);
+    node_->get_parameter("fsm/clamp_local_target", clamp_local_target_);
+    node_->get_parameter("fsm/astar_local_target", astar_local_target_);
+    node_->get_parameter("fsm/astar_search_radius", astar_search_radius_);
+    node_->get_parameter("fsm/astar_lookahead", astar_lookahead_);
+    node_->get_parameter("fsm/astar_global_path", astar_global_path_);
 
     have_trigger_ = !flag_realworld_experiment_;
 
@@ -183,10 +193,82 @@ namespace ego_planner
     planNextWaypoint(wps_[wp_id_]);
   }
 
+  bool EGOReplanFSM::planGlobalWithMap(const Eigen::Vector3d &goal)
+  {
+    if (!astar_global_path_)
+      return false;
+
+    // Fit the global reference through a map-aware route when there is one.
+    //
+    // planGlobalTraj() only fits the endpoints, so the "global" reference is
+    // the straight line from here to the goal with no map information in it at
+    // all, and the local target is sampled off that line.  When the straight
+    // line runs into something the vehicle does not fit through, nothing
+    // downstream recovers the detour: the local optimiser can dodge, but it is
+    // aiming at points on a line that already picked the wrong side.
+    //
+    // A false return is "no opinion", not "fly straight".  An unmapped map is
+    // indistinguishable from a clear one, and the straight line is what every
+    // verified run so far has flown, so it stays the caller's fallback.
+    std::vector<Eigen::Vector3d> route;
+    if (!planner_manager_->planGlobalPathAStar(odom_pos_, goal, route) || route.size() <= 2)
+    {
+      // Logged rather than silently falling back: this flag was tried once
+      // before and produced no log line at all, so the run could not say
+      // whether the search had failed or had found the straight line and been
+      // rejected as redundant.  Those are different answers.
+      RCLCPP_WARN(node_->get_logger(),
+                  "[A* global path] no map-aware route (%zu corners) -- keeping the straight line",
+                  route.size());
+      return false;
+    }
+
+    // Deviation is what makes this worth doing.  A route with corners but no
+    // lateral offset is the straight line again, and fitting a min-snap
+    // through its staircase corners would be an expensive way to reproduce it.
+    const Eigen::Vector3d along = (goal - odom_pos_).normalized();
+    double off_line = 0.0;
+    for (size_t i = 1; i + 1 < route.size(); ++i)
+      off_line = std::max(off_line, ((route[i] - odom_pos_) -
+                                     along * (route[i] - odom_pos_).dot(along)).norm());
+    if (off_line <= 0.5)
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[A* global path] route is straight (%.2f m off line, %zu corners) -- keeping the straight line",
+                  off_line, route.size());
+      return false;
+    }
+
+    // Drop the first corner because planGlobalTrajWaypoints() prepends
+    // start_pos itself, and drop the last because it is the snapped goal
+    // *cell*, up to a snap radius from where the mission asked to go: hand over
+    // the real goal instead.
+    std::vector<Eigen::Vector3d> waypoints(route.begin() + 1, route.end() - 1);
+    waypoints.push_back(goal);
+    if (!planner_manager_->planGlobalTrajWaypoints(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(),
+                                                   waypoints, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero()))
+    {
+      RCLCPP_WARN(node_->get_logger(),
+                  "[A* global path] min-snap fit through %zu corners failed -- keeping the straight line",
+                  waypoints.size());
+      return false;
+    }
+
+    RCLCPP_INFO(node_->get_logger(),
+                "[A* global path] refit through %zu corners, %.2f m off the straight line, "
+                "clearance >= %.2f m (inflation + %d cells)",
+                waypoints.size(), off_line,
+                planner_manager_->last_global_clearance_cells_ * 0.15 + 0.30,
+                planner_manager_->last_global_clearance_cells_);
+    return true;
+  }
+
   void EGOReplanFSM::planNextWaypoint(const Eigen::Vector3d next_wp)
   {
-    bool success = false;
-    success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
+    emergency_refit_done_ = false; // a new goal re-arms the emergency re-fit
+    bool success = planGlobalWithMap(next_wp);
+    if (!success)
+      success = planner_manager_->planGlobalTraj(odom_pos_, odom_vel_, Eigen::Vector3d::Zero(), next_wp, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero());
 
     if (success)
     {
@@ -209,12 +291,22 @@ namespace ego_planner
         changeFSMExecState(GEN_NEW_TRAJ, "TRIG");
       else
       {
-        while (exec_state_ != EXEC_TRAJ)
-        {
-          rclcpp::spin_some(node_);
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        changeFSMExecState(REPLAN_TRAJ, "TRIG");
+        // A new target arrived while a trajectory is already being executed.
+        //
+        // Upstream blocked here in `while (exec_state_ != EXEC_TRAJ)
+        // rclcpp::spin_some(node_)` before switching to REPLAN_TRAJ.  Under
+        // ROS 2 that is fatal twice over:
+        //   * the node is already owned by the executor in main(), so
+        //     spin_some() throws "Node '/ego_planner_node' has already been
+        //     added to an executor" and aborts the process (observed: a second
+        //     goal killed ego_planner_node with SIGABRT), and
+        //   * even without the throw, blocking the executor thread stops
+        //     exec_timer_ from firing, so exec_state_ could never reach
+        //     EXEC_TRAJ and the wait would never end.
+        // The global trajectory has already been replaced above, so just ask
+        // the FSM to replan on its next timer tick.
+        if (exec_state_ != REPLAN_TRAJ && exec_state_ != GEN_NEW_TRAJ)
+          changeFSMExecState(REPLAN_TRAJ, "TRIG");
       }
 
       visualization_->displayGlobalPathList(gloabl_traj, 0.1, 0);
@@ -241,7 +333,14 @@ namespace ego_planner
 
     init_pt_ = odom_pos_;
 
-    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, 1.0);
+    std::string frame;
+    node_->get_parameter("grid_map/frame_id", frame);
+    if (!msg->header.frame_id.empty() && msg->header.frame_id != frame) {
+      RCLCPP_ERROR(node_->get_logger(), "Goal frame must be %s", frame.c_str());
+      return;
+    }
+    Eigen::Vector3d end_wp(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    if (!end_wp.allFinite()) return;
 
     planNextWaypoint(end_wp);
   }
@@ -273,16 +372,15 @@ namespace ego_planner
       return;
 
     // if (abs((ros::Time::now() - msg->start_time).toSec()) > 0.25)
-    rclcpp::Clock clock(RCL_SYSTEM_TIME);  // 确保使用当前节点的时间源
-    auto msg_time = rclcpp::Time(msg->start_time, clock.get_clock_type());
-    // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", rclcpp::Clock().now().get_clock_type());
+    auto msg_time = rclcpp::Time(msg->start_time, node_->get_clock()->get_clock_type());
+    // RCLCPP_INFO(node_->get_logger(), "Clock type: %d", node_->now().get_clock_type());
     // RCLCPP_INFO(node_->get_logger(), "Start time clock type: %d", rclcpp::Time(msg->start_time).get_clock_type());
     // RCLCPP_INFO(node_->get_logger(), "msg_time: %d", msg_time.get_clock_type());
-    if (abs((rclcpp::Clock().now() - msg_time).seconds()) > 0.25)
+    if (abs((node_->now() - msg_time).seconds()) > 0.25)
     {
       // ROS_ERROR("Time difference is too large! Local - Remote Agent %d = %fs", msg->drone_id, (ros::Time::now() - msg->start_time).toSec());
       RCLCPP_ERROR(node_->get_logger(), "Time difference is too large! Local - Remote Agent %d = %fs",
-                   msg->drone_id, (rclcpp::Clock().now() - msg_time).seconds());
+                   msg->drone_id, (node_->now() - msg_time).seconds());
       return;
     }
 
@@ -565,7 +663,7 @@ namespace ego_planner
     {
       /* determine if need to replan */
       LocalTrajData *info = &planner_manager_->local_data_;
-      rclcpp::Time time_now = rclcpp::Clock().now();
+      rclcpp::Time time_now = node_->now();
       double t_cur = (time_now - info->start_time_).seconds();
       t_cur = std::min(info->duration_, t_cur);
 
@@ -583,6 +681,13 @@ namespace ego_planner
       {
         if (t_cur > info->duration_ - 1e-2)
         {
+          // Elapsed trajectory time is not proof of arrival (e.g. delayed
+          // Offboard entry or tracking error). Replan from measured state.
+          if ((odom_pos_ - end_pt_).norm() > 0.2)
+          {
+            changeFSMExecState(GEN_NEW_TRAJ, "TRACKING");
+            break;
+          }
           have_target_ = false;
           have_trigger_ = false;
 
@@ -618,7 +723,26 @@ namespace ego_planner
       else
       {
         if (enable_fail_safe_ && odom_vel_.norm() < 0.1)
+        {
+          // Re-fit the global reference before resuming.  GEN_NEW_TRAJ
+          // re-plans off whatever the current global reference is, and when
+          // that reference is the straight line, resuming off it walks
+          // straight back into the failure that caused the stop -- which is a
+          // loop, not a recovery.
+          //
+          // This is also the moment the map is finally worth consulting.  At
+          // goal time the vehicle has only seen the ~8 m around where it was
+          // standing, and unknown cells read as free, so a search then tends
+          // to return the straight line it was supposed to replace.  By the
+          // time replanning has failed enough to trip the emergency stop the
+          // vehicle has flown into the problem and mapped it.
+          if (astar_global_path_ && !emergency_refit_done_)
+          {
+            emergency_refit_done_ = true;
+            planGlobalWithMap(end_pt_);
+          }
           changeFSMExecState(GEN_NEW_TRAJ, "FSM");
+        }
       }
 
       flag_escape_emergency_ = false;
@@ -626,7 +750,7 @@ namespace ego_planner
     }
     }
 
-    data_disp_.header.stamp = rclcpp::Clock().now();
+    data_disp_.header.stamp = node_->now();
     data_disp_pub_->publish(data_disp_);
 
   force_return:;
@@ -665,7 +789,7 @@ namespace ego_planner
 
     LocalTrajData *info = &planner_manager_->local_data_;
     // ros::Time time_now = ros::Time::now();
-    auto time_now = rclcpp::Clock().now();
+    auto time_now = node_->now();
     // double t_cur = (time_now - info->start_time_).toSec();
     double t_cur = (time_now - info->start_time_).seconds();
 
@@ -717,12 +841,12 @@ namespace ego_planner
     /* ---------- check trajectory ---------- */
     constexpr double time_step = 0.01;
     // double t_cur = (ros::Time::now() - info->start_time_).toSec();
-    double t_cur = (rclcpp::Clock().now() - info->start_time_).seconds();
+    double t_cur = (node_->now() - info->start_time_).seconds();
 
     Eigen::Vector3d p_cur = info->position_traj_.evaluateDeBoorT(t_cur);
     const double CLEARANCE = 1.0 * planner_manager_->getSwarmClearance();
     // double t_cur_global = ros::Time::now().toSec();
-    double t_cur_global = rclcpp::Clock().now().seconds();
+    double t_cur_global = node_->now().seconds();
 
     double t_2_3 = info->duration_ * 2 / 3;
     for (double t = t_cur; t < info->duration_; t += time_step)
@@ -967,12 +1091,115 @@ namespace ego_planner
       planner_manager_->global_data_.last_progress_time_ = planner_manager_->global_data_.global_duration_;
     }
 
+    // The target above is sampled off the *global* polynomial, which carries no
+    // map information, so in a pillar field it lands inside an inflated
+    // obstacle most of the time (measured 62% along the straight run to the
+    // goal).  A local target that is already in collision makes the B-spline
+    // fit unsatisfiable, and reboundReplan then discards the entire curve with
+    // "Rejecting trajectory: inflated-map collision" -- which is what parked
+    // the vehicle ~4 m in.
+    //
+    // Walk the target back toward the current position until it reaches free
+    // space.  Shortening the lookahead is always safe: it can only ever remove
+    // trajectory, never open a path through an obstacle.  Points off the map
+    // report -1, so this also pulls back a target that has run past EGO's
+    // locally-updated region.
+    // The target above is sampled off the *global* polynomial, which carries no
+    // map information at all (planGlobalTraj only fits the endpoints), so its
+    // direction is "straight at the obstacle".  At the mouth of the Penglai
+    // pillar lattice that is exactly the wrong instruction: the curve is asked
+    // to continue +y into a wall of pillars, the optimiser cannot satisfy it,
+    // and the vehicle parks at the lattice edge (measured: 30 s of stall at EGO
+    // y ~ 7.1 with the local target never leaving the obstacle field).
+    //
+    // A short A* on the inflated map gives the direction that actually goes
+    // around.  It is deliberately short: occupancy is only refreshed inside
+    // grid_map/local_update_range (+-8 m here) and cloudCallback only ever
+    // *adds* obstacle cells -- there is no ray-casting, hence no free-space
+    // carving -- so outside that window the map is a record of history, and a
+    // long A* path would be routed around obstacles that may no longer be
+    // there.  Recomputing a short one every replan also lets the target improve
+    // as the map fills in.
+    bool used_astar = false;
+    if (astar_local_target_)
+    {
+      Eigen::Vector3d astar_pt, astar_vel;
+      if (planner_manager_->planLocalTargetAStar(start_pt_, end_pt_, astar_search_radius_,
+                                                 astar_lookahead_, astar_pt, astar_vel))
+      {
+        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000,
+                             "A* local target (%6.2f -> %6.2f) m, xy %.2f %.2f, z %.2f -> %.2f, |path| %zu pts",
+                             (astar_pt - start_pt_).norm(), (astar_pt - local_target_pt_).norm(),
+                             astar_pt(0), astar_pt(1), astar_pt(2), local_target_pt_(2),
+                             planner_manager_->last_astar_path_.size());
+        // Take the *lateral* direction from A* and the altitude from the global
+        // polynomial.  A* searches in 3D and is free to spend the z axis: with
+        // the same endpoint altitude it will happily dip to z = 0.66 m between
+        // two pillars because that is geometrically shorter, and across
+        // replans the target altitude jumped between 0.66 and 2.08 m
+        // (measured), which the vehicle followed down into the pillars.  The
+        // vertical escape is exactly what grid_map/virtual_ceil_height exists
+        // to remove, and the polynomial's own z profile is the one that
+        // correctly carries the climb to cruise altitude and the descent onto
+        // the goal.
+        //
+        // The vertical *velocity* is left at zero.  The tempting source is
+        // global_data_.getVelocity(t), but that is not safe here: on the first
+        // call after a new global trajectory, local_traj_ is empty and t has
+        // already run past global_duration_ (which is what the sampling loop
+        // above leaves behind when the whole trajectory is inside the horizon,
+        // e.g. the 1 m climb at take-off), so getVelocity() takes its else
+        // branch and dereferences local_traj_[0] on an empty vector.  That is
+        // a segfault, and it killed the planner on the first goal of trial 12.
+        // A zero end-derivative in z costs nothing: the position constraint
+        // still carries the curve to the target altitude.
+        astar_pt(2) = local_target_pt_(2);
+        astar_vel(2) = 0.0;
+        local_target_pt_ = astar_pt;
+        local_target_vel_ = astar_vel;
+        used_astar = true;
+      }
+      else
+      {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                             "A* found no route within %.1f m; falling back to the global lookahead.",
+                             astar_search_radius_);
+      }
+    }
+
+    if (clamp_local_target_ && !used_astar)
+    {
+      const double kStep = 0.2, kMaxBackoff = 4.0;
+      double backed = 0.0;
+      while (backed < kMaxBackoff &&
+             planner_manager_->grid_map_->getInflateOccupancy(local_target_pt_) != 0)
+      {
+        Eigen::Vector3d to_start = start_pt_ - local_target_pt_;
+        const double d = to_start.norm();
+        if (d < 1e-3)
+          break;
+        const double step = std::min(kStep, d);
+        local_target_pt_ += to_start / d * step;
+        backed += step;
+      }
+      if (backed > 0.0)
+      {
+        RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 2000,
+                             "Local target was in an inflated obstacle; pulled back %.2f m.",
+                             backed);
+      }
+    }
+
     if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
     {
       local_target_vel_ = Eigen::Vector3d::Zero();
     }
-    else
+    else if (!used_astar)
     {
+      // Only meaningful when the target really came off the global polynomial.
+      // In the A* case this would overwrite the path tangent with the straight-
+      // line velocity, bending the end of the curve back toward the direction
+      // the A* target exists to avoid.
       local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
     }
   }

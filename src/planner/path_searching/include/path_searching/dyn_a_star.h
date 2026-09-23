@@ -63,6 +63,32 @@ private:
 
 	std::vector<GridNodePtr> retrievePath(GridNodePtr current);
 
+	/* Pull a shortest path off the walls it hugs.
+	 *
+	 * A* minimises distance through the *inflated* map, so its cost is identical
+	 * for a path down the middle of a passage and a path shaving its corner --
+	 * and the tie is settled by whichever cells the expansion happens to reach
+	 * first, i.e. by grid geometry.  That matters because this path is not only
+	 * a feasibility witness: BsplineOptimizer::initControlPoints intersects each
+	 * control point's chord with it and uses the intersection as the point the
+	 * optimiser is pulled toward, so a corner-hugging corridor pulls the fitted
+	 * curve into the corner too.  Measured in the Penglai pillar field, the
+	 * widest route through it has 0.55 m of clearance available at every point,
+	 * yet the flown minimum was 0.165-0.205 m on three runs out of four.
+	 *
+	 * Shifting each waypoint to the locally largest free disc keeps the path in
+	 * the same passage (max_shift is well under a passage half-width) while
+	 * moving it to the passage's medial axis.  Endpoints never move, a shift is
+	 * only taken if the point really has more room, and every shifted sub-segment
+	 * is re-checked, so the path stays collision-free and stays monotone.
+	 */
+	std::vector<Eigen::Vector3d> refineToMedialAxis(const std::vector<Eigen::Vector3d> &raw,
+	                                                double max_shift);
+	bool segmentFree(const Eigen::Vector3d &a, const Eigen::Vector3d &b);
+
+	/* Set by refineToMedialAxis via AstarSearch; getPath() prefers it. */
+	std::vector<Eigen::Vector3d> path_override_;
+
 	double step_size_, inv_step_size_;
 	Eigen::Vector3d center_;
 	Eigen::Vector3i CENTER_IDX_, POOL_SIZE_;

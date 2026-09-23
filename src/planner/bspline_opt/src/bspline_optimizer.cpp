@@ -1614,26 +1614,56 @@ namespace ego_planner
         // 计算时间步长
         double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
         // 遍历轨迹的前2/3部分进行障碍物检测
+        //
+        // The first control point is pinned to the vehicle's current position
+        // (see initControlPoints), so a collision inside the first control
+        // interval does not mean the optimizer produced a bad curve -- it means
+        // the *vehicle itself* is standing inside an inflated cell.  This is
+        // reachable in normal flight: the inflation is a safety margin, and a
+        // 0.45 m margin around a mapped pillar cell is only one tracking error
+        // wide.
+        //
+        // Treating that as an outright rejection is unrecoverable, because no
+        // amount of replanning moves the vehicle's own position: every replan
+        // fails the same way, EGO stops publishing trajectories, traj_server
+        // replays the last one to its end and the vehicle falls out of the sky.
+        // Measured in the Penglai pillar field: 812 consecutive rejections,
+        // then a 0.69 m/s descent to the ground with no recovery.
+        //
+        // Reject only when the curve is *still* inside an obstacle one control
+        // interval later, i.e. it has not cleared the inflated cell within the
+        // first B-spline segment (~0.45 m of travel at max_vel 0.4 m/s, more
+        // than the 0.45 m inflation).  A start-region collision that the curve
+        // does escape is tolerated and the scan continues, so a genuine
+        // collision further along the curve still forces a restart and a higher
+        // collision weight.
         for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
         {
-          flag_occ = grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t));
-          if (flag_occ)
-          {
-            // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+          if (!grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t)))
+            continue;
 
-            // 如果在前三个控制点范围内检测到了碰撞则视为不可行
-            if (t <= bspline_interval_) // First 3 control points in obstacles!
+          // cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
+
+          // 如果在前三个控制点范围内检测到了碰撞则视为不可行
+          if (t <= bspline_interval_) // First 3 control points in obstacles!
+          {
+            // cout << cps_.points.col(1).transpose() << "\n"
+            //      << cps_.points.col(2).transpose() << "\n"
+            //      << cps_.points.col(3).transpose() << "\n"
+            //      << cps_.points.col(4).transpose() << endl;
+            if (bspline_interval_ >= tmp ||
+                grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(bspline_interval_)))
             {
-              // cout << cps_.points.col(1).transpose() << "\n"
-              //      << cps_.points.col(2).transpose() << "\n"
-              //      << cps_.points.col(3).transpose() << "\n"
-              //      << cps_.points.col(4).transpose() << endl;
-              RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"), "First 3 control points in obstacles! return false, t=%f", t);
+              RCLCPP_WARN(rclcpp::get_logger("rebound_optimize"),
+                          "First 3 control points in obstacles and the curve is still there at t=%f; return false, t=%f",
+                          bspline_interval_, t);
               return false;
             }
-
-            break;
+            continue; // tolerated: the pinned start is inside an inflated cell but the curve clears it
           }
+
+          flag_occ = true; // a genuine collision: restart the optimisation with a higher collision weight
+          break;
         }
 
         // cout << "XXXXXX" << ((cps_.points.col(cps_.points.cols()-1) + 4*cps_.points.col(cps_.points.cols()-2) + cps_.points.col(cps_.points.cols()-3))/6 - local_target_pt_).norm() << endl;
