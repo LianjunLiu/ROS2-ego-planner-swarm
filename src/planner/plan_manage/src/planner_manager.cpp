@@ -665,14 +665,14 @@ namespace ego_planner
 
       t_opt = node_->now() - t_start;
 
-      visualization_->displayMultiInitPathList(vis_trajs, 0.2);
+      visualization_->displayMultiInitPathList(vis_trajs, 0.1); // scale/2 = 0.05，与 optimal/global 线宽统一
     }
     else
     {
       flag_step_1_success = bspline_optimizer_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
       t_opt = node_->now() - t_start;
       // static int vis_id = 0;
-      visualization_->displayInitPathList(point_set, 0.2, 0);
+      visualization_->displayInitPathList(point_set, 0.1, 0); // scale/2 = 0.05，与 optimal/global 线宽统一
     }
 
     cout << "plan_success=" << flag_step_1_success << endl;
